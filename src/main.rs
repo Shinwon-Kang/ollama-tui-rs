@@ -1,4 +1,4 @@
-use std::process::exit;
+use std::{net::Shutdown, process::exit};
 
 use ratatui::{
     buffer::Buffer,
@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 struct App {
     exit: bool,
     models_info: ModelInfo,
+    api_status: bool,
+    ollama_api: OllamaApi,
 }
 
 struct ModelInfo {
@@ -46,36 +48,62 @@ struct ModelDetails {
     quantization_level: String,
 }
 
-impl Default for App {
+struct OllamaApi {
+    base_url: String,
+}
+
+impl Default for OllamaApi {
     fn default() -> Self {
         Self {
-            exit: false,
-            // TODO: load models from api
-            models_info: ModelInfo {
-                models: ModelList {
-                    models: vec![Model {
-                        name: "Model 1".to_string(),
-                        model: "model1".to_string(),
-                        modified_at: "2021-01-01".to_string(),
-                        size: 1000,
-                        digest: "digest1".to_string(),
-                        details: ModelDetails {
-                            format: "gguf".to_string(),
-                            family: "llama".to_string(),
-                            families: None,
-                            parameter_size: "7B".to_string(),
-                            quantization_level: "Q4_0".to_string(),
-                        },
-                    }],
-                },
-                selected_model: ListState::default(),
-            },
+            base_url: "http://localhost:11434".to_string(),
         }
     }
 }
 
+impl OllamaApi {
+    async fn get_models(&self) -> Result<ModelList, reqwest::Error> {
+        let response = reqwest::get(format!("{}/api/tags", self.base_url)).await;
+        match response {
+            Ok(response) => {
+                let response = response.bytes().await.unwrap();
+                let model_list = serde_json::from_slice::<ModelList>(&response).unwrap();
+                Ok(model_list)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    // TODO
+    async fn generate(&self, prompt: String) -> Result<String, reqwest::Error> {
+        Ok("".to_string())
+    }
+}
+
+impl Default for ModelInfo {
+    fn default() -> Self {
+        Self {
+            models: ModelList { models: vec![] },
+            selected_model: ListState::default(),
+        }
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            exit: false,
+            ollama_api: OllamaApi::default(),
+            api_status: false,
+            models_info: ModelInfo::default(),
+        }
+    }
+}
+
+// App logic
 impl App {
-    fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
+    async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
+        self.load_models().await;
+
         while !self.exit {
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             if let Event::Key(key) = event::read()? {
@@ -99,7 +127,10 @@ impl App {
             _ => {}
         }
     }
+}
 
+// UI
+impl App {
     fn render_header(&mut self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(
             r"
@@ -113,13 +144,17 @@ impl App {
         .render(area, buf);
     }
 
+    fn render_api_status(&mut self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new("hi").centered().render(area, buf);
+    }
+
     fn render_model_list(&mut self, area: Rect, buf: &mut Buffer) {
         let items: Vec<ListItem> = self
             .models_info
             .models
             .models
             .iter()
-            .map(|model| ListItem::new(format!("{}", model.name)))
+            .map(|model| ListItem::new(format!("● {}", model.name)))
             .collect();
 
         let list = List::new(items)
@@ -127,6 +162,22 @@ impl App {
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(list, area, buf, &mut self.models_info.selected_model);
+    }
+}
+
+// Ollama API
+impl App {
+    async fn load_models(&mut self) {
+        let models = self.ollama_api.get_models().await;
+        match models {
+            Ok(models) => {
+                self.models_info.models = models;
+            }
+            Err(error) => {
+                eprintln!("Error loading models: {}", error);
+                // TODO: show error message on tui
+            }
+        }
     }
 }
 
@@ -149,26 +200,24 @@ impl Widget for &mut App {
             .areas(list_area);
 
         self.render_header(header_area, buf);
+        // TODO
+        // self.render_api_status(api_status_area, buf);
         self.render_model_list(list_area, buf);
     }
 }
 
+fn shutdown() -> std::io::Result<()> {
+    crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::terminal::disable_raw_mode()?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let res = reqwest::get("http://localhost:11434/api/tags").await;
-    match res {
-        Ok(res) => {
-            let body = res.bytes().await.unwrap();
-            let models = serde_json::from_slice::<ModelList>(&body)?;
-            println!("{:?}", models);
-        }
-        Err(e) => {
-            println!("Error: {}", e);
-        }
-    }
-
     let terminal = ratatui::init();
-    let result = App::default().run(terminal);
-    ratatui::restore();
-    result
+
+    App::default().run(terminal).await?;
+    shutdown()?;
+
+    Ok(())
 }
