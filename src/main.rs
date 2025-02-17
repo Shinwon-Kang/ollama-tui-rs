@@ -15,8 +15,14 @@ use serde::{Deserialize, Serialize};
 struct App {
     exit: bool,
     models_info: ModelInfo,
-    api_status: bool,
     ollama_api: OllamaApi,
+    input: String,
+    input_mode: InputMode,
+}
+
+enum InputMode {
+    Normal,
+    Editing,
 }
 
 struct ModelInfo {
@@ -93,8 +99,9 @@ impl Default for App {
         Self {
             exit: false,
             ollama_api: OllamaApi::default(),
-            api_status: false,
             models_info: ModelInfo::default(),
+            input: String::new(),
+            input_mode: InputMode::Normal,
         }
     }
 }
@@ -104,6 +111,7 @@ impl App {
     async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         self.load_models().await;
 
+        let mut a = 0;
         while !self.exit {
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             if let Event::Key(key) = event::read()? {
@@ -123,8 +131,17 @@ impl App {
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Down => self.models_info.selected_model.select_next(),
             KeyCode::Up => self.models_info.selected_model.select_previous(),
-            KeyCode::Enter => {}
+            KeyCode::Enter => self.select_model(),
             _ => {}
+        }
+    }
+
+    fn select_model(&mut self) {
+        if let Some(selected_model) = self.models_info.selected_model.selected() {
+            println!(
+                "Selected model: {}",
+                self.models_info.models.models[selected_model].name
+            );
         }
     }
 }
@@ -144,10 +161,6 @@ impl App {
         .render(area, buf);
     }
 
-    fn render_api_status(&mut self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("hi").centered().render(area, buf);
-    }
-
     fn render_model_list(&mut self, area: Rect, buf: &mut Buffer) {
         let items: Vec<ListItem> = self
             .models_info
@@ -162,6 +175,19 @@ impl App {
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(list, area, buf, &mut self.models_info.selected_model);
+    }
+
+    fn render_text_input(&mut self, area: Rect, buf: &mut Buffer) {
+        let input = Paragraph::new(self.input.as_str())
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::bordered().title("Input"));
+
+        input.render(area, buf);
+    }
+
+    fn render_helper(&mut self, area: Rect, buf: &mut Buffer) {
+        let text = "▲ ▼: select, Enter: choose, q: quit";
+        Paragraph::new(text).centered().render(area, buf);
     }
 }
 
@@ -183,13 +209,21 @@ impl App {
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let [header_area, list_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(area);
+        let [header_area, list_area, footer_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         // TODO: length should be dynamic based on the number of models
         let [header_area] = Layout::vertical([Constraint::Length(7)])
             .flex(Flex::Center)
             .areas(header_area);
+
+        // TODO: separate input area
+        let [list_area, input_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(list_area);
 
         // TODO: length should be dynamic based on the number of models
         let [list_area] = Layout::horizontal([Constraint::Length(15)])
@@ -200,9 +234,9 @@ impl Widget for &mut App {
             .areas(list_area);
 
         self.render_header(header_area, buf);
-        // TODO
-        // self.render_api_status(api_status_area, buf);
         self.render_model_list(list_area, buf);
+        self.render_text_input(input_area, buf);
+        self.render_helper(footer_area, buf);
     }
 }
 
