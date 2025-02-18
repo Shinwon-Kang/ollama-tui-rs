@@ -3,12 +3,13 @@ use std::{net::Shutdown, process::exit};
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span, Text},
     widgets::{
         Block, HighlightSpacing, List, ListItem, ListState, Paragraph, StatefulWidget, Widget,
     },
-    DefaultTerminal,
+    DefaultTerminal, Frame,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +17,11 @@ struct App {
     exit: bool,
     models_info: ModelInfo,
     ollama_api: OllamaApi,
+
     input: String,
     input_mode: InputMode,
+    character_index: usize,
+    chat_log: Vec<String>,
 }
 
 enum InputMode {
@@ -102,6 +106,8 @@ impl Default for App {
             models_info: ModelInfo::default(),
             input: String::new(),
             input_mode: InputMode::Normal,
+            character_index: 0,
+            chat_log: Vec::new(),
         }
     }
 }
@@ -111,9 +117,8 @@ impl App {
     async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         self.load_models().await;
 
-        let mut a = 0;
         while !self.exit {
-            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+            terminal.draw(|frame| self.draw(frame))?;
             if let Event::Key(key) = event::read()? {
                 self.handle_key(key);
             }
@@ -127,12 +132,24 @@ impl App {
             return;
         }
 
-        match key.code {
-            KeyCode::Char('q') => self.exit = true,
-            KeyCode::Down => self.models_info.selected_model.select_next(),
-            KeyCode::Up => self.models_info.selected_model.select_previous(),
-            KeyCode::Enter => self.select_model(),
-            _ => {}
+        match self.input_mode {
+            InputMode::Normal => match key.code {
+                KeyCode::Esc => self.exit = true,
+                KeyCode::Char('e') => self.input_mode = InputMode::Editing, // TODO: change to input mode
+                KeyCode::Down => self.models_info.selected_model.select_next(),
+                KeyCode::Up => self.models_info.selected_model.select_previous(),
+                KeyCode::Enter => self.select_model(),
+                _ => {}
+            },
+            InputMode::Editing => match key.code {
+                KeyCode::Enter => self.chat_message(),
+                KeyCode::Char(c) => self.update_input(c),
+                KeyCode::Backspace => self.delete_input(),
+                KeyCode::Left => self.move_cursor_left(),
+                KeyCode::Right => self.move_cursor_right(),
+                KeyCode::Esc => self.input_mode = InputMode::Normal,
+                _ => {}
+            },
         }
     }
 
@@ -144,12 +161,107 @@ impl App {
             );
         }
     }
+
+    fn chat_message(&mut self) {
+        self.chat_log.push(self.input.clone());
+        self.input.clear();
+        self.reset_cursor();
+    }
+
+    fn get_character_index(&self) -> usize {
+        self.input
+            .char_indices()
+            .map(|(i, _)| i)
+            .nth(self.character_index)
+            .unwrap_or(self.input.len())
+    }
+
+    fn move_cursor_left(&mut self) {
+        let cursor_moved_left = self.character_index.saturating_sub(1);
+        self.character_index = self.clamp_cursor(cursor_moved_left);
+    }
+
+    fn move_cursor_right(&mut self) {
+        let cursor_moved_right = self.character_index.saturating_add(1);
+        self.character_index = self.clamp_cursor(cursor_moved_right);
+    }
+
+    fn clamp_cursor(&self, cursor_index: usize) -> usize {
+        cursor_index.clamp(0, self.input.chars().count())
+    }
+
+    fn reset_cursor(&mut self) {
+        self.character_index = 0;
+    }
+
+    fn update_input(&mut self, c: char) {
+        let index = self.get_character_index();
+        self.input.insert(index, c);
+        self.move_cursor_right();
+    }
+
+    fn delete_input(&mut self) {
+        let is_not_cursor_leftmost = self.character_index != 0;
+        if is_not_cursor_leftmost {
+            let current_index = self.character_index;
+            let from_left_to_current_index = current_index - 1;
+
+            let before_char_to_delete = self.input.chars().take(from_left_to_current_index);
+            let after_char_to_delete = self.input.chars().skip(current_index);
+
+            self.input = before_char_to_delete.chain(after_char_to_delete).collect();
+            self.move_cursor_left();
+        }
+    }
 }
 
 // UI
 impl App {
-    fn render_header(&mut self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(
+    fn draw(&mut self, frame: &mut Frame) {
+        let [header_area, list_area, footer_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(3),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        // TODO: length should be dynamic based on the number of models
+        let [header_area] = Layout::vertical([Constraint::Length(7)])
+            .flex(Flex::Center)
+            .areas(header_area);
+
+        // TODO: separate input area
+        let [list_area, chat_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Fill(4)]).areas(list_area);
+
+        let [chat_area, input_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(chat_area);
+
+        // TODO: length should be dynamic based on the number of models
+        let [list_area] = Layout::horizontal([Constraint::Length(15)])
+            .flex(Flex::Center)
+            .areas(list_area);
+        let [list_area] = Layout::vertical([Constraint::Length(2)])
+            .flex(Flex::Center)
+            .areas(list_area);
+
+        self.render_header(frame, header_area);
+        self.render_model_list(frame, list_area);
+        self.render_chat(frame, chat_area);
+        self.render_text_input(frame, input_area);
+        self.render_helper(frame, footer_area);
+
+        match self.input_mode {
+            InputMode::Normal => {}
+            InputMode::Editing => frame.set_cursor_position(Position::new(
+                input_area.x + self.character_index as u16 + 1,
+                input_area.y + 1,
+            )),
+        }
+    }
+
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
+        let header = Paragraph::new(
             r"
        _ _                             _         _                
   ___ | | | __ _ _ __ ___   __ _      | |_ _   _(_)      _ __ ___ 
@@ -157,11 +269,11 @@ impl App {
 | (_) | | | (_| | | | | | | (_| |_____| |_| |_| | |_____| |  \__ \
  \___/|_|_|\__,_|_| |_| |_|\__,_|      \__|\__,_|_|     |_|  |___/",
         )
-        .centered()
-        .render(area, buf);
+        .centered();
+        frame.render_widget(header, area);
     }
 
-    fn render_model_list(&mut self, area: Rect, buf: &mut Buffer) {
+    fn render_model_list(&mut self, frame: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = self
             .models_info
             .models
@@ -174,20 +286,41 @@ impl App {
             .highlight_symbol("> ")
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(list, area, buf, &mut self.models_info.selected_model);
+        frame.render_stateful_widget(list, area, &mut self.models_info.selected_model);
     }
 
-    fn render_text_input(&mut self, area: Rect, buf: &mut Buffer) {
+    fn render_chat(&mut self, frame: &mut Frame, area: Rect) {
+        let chat_log: Vec<ListItem> = self
+            .chat_log
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let content = Line::from(Span::raw(format!("{i}: {c}")));
+                ListItem::new(content)
+            })
+            .collect();
+
+        let chat = List::new(chat_log).block(Block::bordered().title("Chat"));
+
+        frame.render_widget(chat, area);
+    }
+
+    fn render_text_input(&mut self, frame: &mut Frame, area: Rect) {
         let input = Paragraph::new(self.input.as_str())
-            .style(Style::default().fg(Color::Yellow))
+            .style(match self.input_mode {
+                InputMode::Normal => Style::default(),
+                InputMode::Editing => Style::default().fg(Color::Yellow),
+            })
             .block(Block::bordered().title("Input"));
 
-        input.render(area, buf);
+        frame.render_widget(input, area);
     }
 
-    fn render_helper(&mut self, area: Rect, buf: &mut Buffer) {
+    fn render_helper(&mut self, frame: &mut Frame, area: Rect) {
         let text = "▲ ▼: select, Enter: choose, q: quit";
-        Paragraph::new(text).centered().render(area, buf);
+        let helper = Paragraph::new(text).centered();
+
+        frame.render_widget(helper, area);
     }
 }
 
@@ -204,39 +337,6 @@ impl App {
                 // TODO: show error message on tui
             }
         }
-    }
-}
-
-impl Widget for &mut App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let [header_area, list_area, footer_area] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
-        // TODO: length should be dynamic based on the number of models
-        let [header_area] = Layout::vertical([Constraint::Length(7)])
-            .flex(Flex::Center)
-            .areas(header_area);
-
-        // TODO: separate input area
-        let [list_area, input_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(list_area);
-
-        // TODO: length should be dynamic based on the number of models
-        let [list_area] = Layout::horizontal([Constraint::Length(15)])
-            .flex(Flex::Center)
-            .areas(list_area);
-        let [list_area] = Layout::vertical([Constraint::Length(2)])
-            .flex(Flex::Center)
-            .areas(list_area);
-
-        self.render_header(header_area, buf);
-        self.render_model_list(list_area, buf);
-        self.render_text_input(input_area, buf);
-        self.render_helper(footer_area, buf);
     }
 }
 
