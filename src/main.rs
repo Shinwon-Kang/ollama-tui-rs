@@ -3,11 +3,12 @@ use std::{net::Shutdown, process::exit};
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Constraint, Flex, Layout, Position, Rect},
+    layout::{Constraint, Flex, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{
-        Block, HighlightSpacing, List, ListItem, ListState, Paragraph, StatefulWidget, Widget,
+        Block, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
     },
     DefaultTerminal, Frame,
 };
@@ -16,12 +17,18 @@ use serde::{Deserialize, Serialize};
 struct App {
     exit: bool,
     models_info: ModelInfo,
+    selected_model: Model,
     ollama_api: OllamaApi,
+
+    last_chat_area_height: usize,
+    last_chat_area_width: usize,
 
     input: String,
     input_mode: InputMode,
     character_index: usize,
     chat_log: Vec<String>,
+    chat_scroll_state: ScrollbarState,
+    chat_scroll: usize,
 }
 
 enum InputMode {
@@ -39,7 +46,7 @@ struct ModelList {
     models: Vec<Model>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 struct Model {
     name: String,
     model: String,
@@ -49,7 +56,7 @@ struct Model {
     details: ModelDetails,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 struct ModelDetails {
     format: String,
     family: String,
@@ -102,12 +109,17 @@ impl Default for App {
     fn default() -> Self {
         Self {
             exit: false,
-            ollama_api: OllamaApi::default(),
             models_info: ModelInfo::default(),
+            selected_model: Model::default(),
+            ollama_api: OllamaApi::default(),
+            last_chat_area_height: 0,
+            last_chat_area_width: 0,
             input: String::new(),
             input_mode: InputMode::Normal,
             character_index: 0,
             chat_log: Vec::new(),
+            chat_scroll_state: ScrollbarState::new(0).position(0),
+            chat_scroll: 0,
         }
     }
 }
@@ -135,34 +147,72 @@ impl App {
         match self.input_mode {
             InputMode::Normal => match key.code {
                 KeyCode::Esc => self.exit = true,
-                KeyCode::Char('e') => self.input_mode = InputMode::Editing, // TODO: change to input mode
+                KeyCode::Char('e') => {
+                    if self.selected_model.name.is_empty() {
+                        return;
+                    }
+                    self.input_mode = InputMode::Editing;
+                }
                 KeyCode::Down => self.models_info.selected_model.select_next(),
                 KeyCode::Up => self.models_info.selected_model.select_previous(),
                 KeyCode::Enter => self.select_model(),
                 _ => {}
             },
             InputMode::Editing => match key.code {
-                KeyCode::Enter => self.chat_message(),
+                KeyCode::Enter => {
+                    self.chat_message();
+
+                    // TODO: analyze the code
+                    if self.chat_log.len() > (self.last_chat_area_height - 2) {
+                        self.chat_scroll = self.chat_log.len() - (self.last_chat_area_height - 2);
+                    } else {
+                        self.chat_scroll = 0;
+                    }
+                    self.chat_scroll_state.last();
+                }
                 KeyCode::Char(c) => self.update_input(c),
                 KeyCode::Backspace => self.delete_input(),
                 KeyCode::Left => self.move_cursor_left(),
                 KeyCode::Right => self.move_cursor_right(),
+                KeyCode::Down => {
+                    // TODO: analyze the code
+                    let mut clamp: usize = 0;
+                    if self.chat_log.len() > self.last_chat_area_height - 2 {
+                        clamp = self.chat_log.len() - (self.last_chat_area_height - 2) + 1;
+                    }
+
+                    self.chat_scroll = self
+                        .chat_scroll
+                        .saturating_add(1)
+                        .clamp(0, clamp.saturating_sub(1));
+                    self.chat_scroll_state.next();
+                }
+                KeyCode::Up => {
+                    self.chat_scroll = self.chat_scroll.saturating_sub(1);
+                    self.chat_scroll_state.prev();
+                }
                 KeyCode::Esc => self.input_mode = InputMode::Normal,
                 _ => {}
             },
         }
     }
 
+    fn set_chat_area_size(&mut self, area: Rect) {
+        self.last_chat_area_height = area.height.into();
+        self.last_chat_area_width = area.width.into();
+    }
+
     fn select_model(&mut self) {
         if let Some(selected_model) = self.models_info.selected_model.selected() {
-            println!(
-                "Selected model: {}",
-                self.models_info.models.models[selected_model].name
-            );
+            self.selected_model = self.models_info.models.models[selected_model].clone();
         }
     }
 
     fn chat_message(&mut self) {
+        if self.input.is_empty() {
+            return;
+        }
+
         self.chat_log.push(self.input.clone());
         self.input.clear();
         self.reset_cursor();
@@ -219,8 +269,8 @@ impl App {
 impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let [header_area, list_area, footer_area] = Layout::vertical([
+            Constraint::Length(6),
             Constraint::Fill(1),
-            Constraint::Fill(3),
             Constraint::Length(1),
         ])
         .areas(frame.area());
@@ -231,8 +281,11 @@ impl App {
             .areas(header_area);
 
         // TODO: separate input area
-        let [list_area, chat_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Fill(4)]).areas(list_area);
+        let [list_area, chat_area] = Layout::vertical([
+            Constraint::Length(self.models_info.models.models.len() as u16 + 2),
+            Constraint::Fill(6),
+        ])
+        .areas(list_area);
 
         let [chat_area, input_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(chat_area);
@@ -258,18 +311,18 @@ impl App {
                 input_area.y + 1,
             )),
         }
+
+        self.set_chat_area_size(chat_area);
     }
 
     fn render_header(&mut self, frame: &mut Frame, area: Rect) {
-        let header = Paragraph::new(
-            r"
-       _ _                             _         _                
+        let logo = r"       _ _                             _         _                
   ___ | | | __ _ _ __ ___   __ _      | |_ _   _(_)      _ __ ___ 
  / _ \| | |/ _` | '_ ` _ \ / _` |_____| __| | | | |_____| '__/ __|
 | (_) | | | (_| | | | | | | (_| |_____| |_| |_| | |_____| |  \__ \
- \___/|_|_|\__,_|_| |_| |_|\__,_|      \__|\__,_|_|     |_|  |___/",
-        )
-        .centered();
+ \___/|_|_|\__,_|_| |_| |_|\__,_|      \__|\__,_|_|     |_|  |___/";
+
+        let header = Paragraph::new(logo).centered();
         frame.render_widget(header, area);
     }
 
@@ -279,7 +332,13 @@ impl App {
             .models
             .models
             .iter()
-            .map(|model| ListItem::new(format!("● {}", model.name)))
+            .map(|model| {
+                if model.name == self.selected_model.name {
+                    ListItem::new(format!("✓ {}", model.name).fg(Color::Green))
+                } else {
+                    ListItem::new(format!("☐ {}", model.name))
+                }
+            })
             .collect();
 
         let list = List::new(items)
@@ -289,20 +348,34 @@ impl App {
         frame.render_stateful_widget(list, area, &mut self.models_info.selected_model);
     }
 
+    // TODO: Scrollbar
     fn render_chat(&mut self, frame: &mut Frame, area: Rect) {
-        let chat_log: Vec<ListItem> = self
+        let chat_log: Vec<Line> = self
             .chat_log
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let content = Line::from(Span::raw(format!("{i}: {c}")));
-                ListItem::new(content)
-            })
+            .map(|(i, c)| Line::from(Span::raw(format!("{i}: {c}"))))
             .collect();
 
-        let chat = List::new(chat_log).block(Block::bordered().title("Chat"));
-
+        let chat = Paragraph::new(chat_log)
+            .block(Block::bordered().title("Chat"))
+            .scroll((self.chat_scroll as u16, 0));
         frame.render_widget(chat, area);
+
+        self.chat_scroll_state = self
+            .chat_scroll_state
+            .content_length(self.chat_log.len().saturating_sub(area.height as usize - 2));
+
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓")),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut self.chat_scroll_state,
+        );
     }
 
     fn render_text_input(&mut self, frame: &mut Frame, area: Rect) {
@@ -317,8 +390,18 @@ impl App {
     }
 
     fn render_helper(&mut self, frame: &mut Frame, area: Rect) {
-        let text = "▲ ▼: select, Enter: choose, q: quit";
-        let helper = Paragraph::new(text).centered();
+        let normal_mode_text = "▲ ▼: model select, Enter: choose model, e: edit, Esc: quit";
+        let editing_mode_text = "▲ ▼: chat scroll, Enter: send message, Esc: back to model select";
+
+        let helper: Paragraph;
+        match self.input_mode {
+            InputMode::Normal => {
+                helper = Paragraph::new(normal_mode_text).centered();
+            }
+            InputMode::Editing => {
+                helper = Paragraph::new(editing_mode_text).centered();
+            }
+        }
 
         frame.render_widget(helper, area);
     }
