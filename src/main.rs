@@ -1,5 +1,6 @@
 use std::{net::Shutdown, process::exit};
 
+use futures::StreamExt;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
@@ -13,6 +14,7 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::io::StreamReader;
 
 struct App {
     exit: bool,
@@ -26,6 +28,7 @@ struct App {
     input: String,
     input_mode: InputMode,
     character_index: usize,
+
     chat_log: Vec<String>,
     chat_scroll_state: ScrollbarState,
     chat_scroll: usize,
@@ -65,14 +68,49 @@ struct ModelDetails {
     quantization_level: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<MessageChunk>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ChatResponse {
+    model: String,
+    created_at: String,
+    message: MessageChunk,
+    done: bool,
+}
+
+struct ChatResponseFinal {
+    model: String,
+    created_at: String,
+    done: bool,
+    total_duration: u64,
+    load_duration: u64,
+    prompt_eval_count: u64,
+    prompt_eval_duration: u64,
+    eval_count: u64,
+    eval_duration: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MessageChunk {
+    role: String,
+    content: String,
+    images: Option<Vec<String>>,
+}
+
 struct OllamaApi {
     base_url: String,
+    client: reqwest::Client,
 }
 
 impl Default for OllamaApi {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:11434".to_string(),
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -91,7 +129,54 @@ impl OllamaApi {
     }
 
     // TODO
-    async fn generate(&self, prompt: String) -> Result<String, reqwest::Error> {
+    async fn chat(&self, chat_request: ChatRequest) -> Result<String, reqwest::Error> {
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .body(serde_json::to_string(&chat_request).unwrap())
+            .send()
+            .await;
+
+        // Return : -> Result<()>
+
+        // let stream = res.bytes_stream().map_err(convert_err);
+        // let mut lines_reader = StreamReader::new(stream).lines();
+
+        // while let Ok(line) = lines_reader.next_line().await {
+        //     if line.is_none() {
+        //         break;
+        //     }
+
+        //     let ores: CompletionResponse = serde_json::from_str(&line.unwrap()).unwrap();
+        //     tracing::debug!(body = ?ores, "Completion response");
+        //     let mut msg = BackendResponse {
+        //         author: Author::Model,
+        //         text: ores.response,
+        //         done: ores.done,
+        //         context: None,
+        //     };
+        //     if ores.done && ores.context.is_some() {
+        //         msg.context = Some(serde_json::to_string(&ores.context)?);
+        //     }
+
+        //     tx.send(Event::BackendPromptResponse(msg))?;
+        // }
+
+        match response {
+            Ok(response) => {
+                if response.status().is_success() {
+                    let mut stream = response.bytes_stream();
+                    while let Some(item) = stream.next().await {
+                        let message = serde_json::from_slice::<ChatResponse>(&item.unwrap());
+                        println!("Message: {:?}", message);
+                    }
+                }
+            }
+            Err(error) => {
+                println!("error: {:?}", error);
+            }
+        }
+
         Ok("".to_string())
     }
 }
@@ -132,14 +217,14 @@ impl App {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
             if let Event::Key(key) = event::read()? {
-                self.handle_key(key);
+                self.handle_key(key).await;
             }
         }
 
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    async fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
@@ -160,7 +245,7 @@ impl App {
             },
             InputMode::Editing => match key.code {
                 KeyCode::Enter => {
-                    self.chat_message();
+                    self.chat_message().await;
 
                     // TODO: analyze the code
                     if self.chat_log.len() > (self.last_chat_area_height - 2) {
@@ -208,12 +293,16 @@ impl App {
         }
     }
 
-    fn chat_message(&mut self) {
+    async fn chat_message(&mut self) {
         if self.input.is_empty() {
             return;
         }
 
         self.chat_log.push(self.input.clone());
+
+        // TODO: ...
+        self.chat(self.input.clone()).await;
+
         self.input.clear();
         self.reset_cursor();
     }
@@ -420,6 +509,20 @@ impl App {
                 // TODO: show error message on tui
             }
         }
+    }
+
+    async fn chat(&mut self, prompt: String) {
+        let chat_request = ChatRequest {
+            model: self.selected_model.name.clone(),
+            // TODO: add history
+            messages: vec![MessageChunk {
+                role: "user".to_string(),
+                content: prompt,
+                images: None,
+            }],
+        };
+
+        let chat_response = self.ollama_api.chat(chat_request).await;
     }
 }
 
