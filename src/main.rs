@@ -9,7 +9,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+        ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget, Wrap,
     },
     DefaultTerminal, Frame,
 };
@@ -29,7 +29,8 @@ struct App {
     input_mode: InputMode,
     character_index: usize,
 
-    chat_log: Vec<String>,
+    chat_log: ChatLog,
+
     chat_scroll_state: ScrollbarState,
     chat_scroll: usize,
 }
@@ -68,13 +69,35 @@ struct ModelDetails {
     quantization_level: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Debug)]
+struct ChatLog {
+    history: Vec<Chat>,
+    // lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Chat {
+    author: String,
+    content: String,
+    // origin_content is usually a single item, but may contain multiple items for OllamaResponse
+    origin_content: Vec<ChatType>,
+}
+
+#[derive(Debug, Clone)]
+enum ChatType {
+    UserRequest(String),
+    SystemResponse(String),
+    OllamaRequest(ChatRequest),
+    OllamaResponse(ChatResponse),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<MessageChunk>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ChatResponse {
     model: String,
     created_at: String,
@@ -82,19 +105,19 @@ struct ChatResponse {
     done: bool,
 }
 
-struct ChatResponseFinal {
-    model: String,
-    created_at: String,
-    done: bool,
-    total_duration: u64,
-    load_duration: u64,
-    prompt_eval_count: u64,
-    prompt_eval_duration: u64,
-    eval_count: u64,
-    eval_duration: u64,
-}
+// struct ChatResponseFinal {
+//     model: String,
+//     created_at: String,
+//     done: bool,
+//     total_duration: u64,
+//     load_duration: u64,
+//     prompt_eval_count: u64,
+//     prompt_eval_duration: u64,
+//     eval_count: u64,
+//     eval_duration: u64,
+// }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct MessageChunk {
     role: String,
     content: String,
@@ -129,7 +152,7 @@ impl OllamaApi {
     }
 
     // TODO
-    async fn chat(&self, chat_request: ChatRequest) -> Result<String, reqwest::Error> {
+    async fn chat(&self, chat_request: ChatRequest) -> Result<Vec<ChatResponse>, std::io::Error> {
         let response = self
             .client
             .post(format!("{}/api/chat", self.base_url))
@@ -137,39 +160,17 @@ impl OllamaApi {
             .send()
             .await;
 
-        // Return : -> Result<()>
-
-        // let stream = res.bytes_stream().map_err(convert_err);
-        // let mut lines_reader = StreamReader::new(stream).lines();
-
-        // while let Ok(line) = lines_reader.next_line().await {
-        //     if line.is_none() {
-        //         break;
-        //     }
-
-        //     let ores: CompletionResponse = serde_json::from_str(&line.unwrap()).unwrap();
-        //     tracing::debug!(body = ?ores, "Completion response");
-        //     let mut msg = BackendResponse {
-        //         author: Author::Model,
-        //         text: ores.response,
-        //         done: ores.done,
-        //         context: None,
-        //     };
-        //     if ores.done && ores.context.is_some() {
-        //         msg.context = Some(serde_json::to_string(&ores.context)?);
-        //     }
-
-        //     tx.send(Event::BackendPromptResponse(msg))?;
-        // }
-
         match response {
             Ok(response) => {
                 if response.status().is_success() {
-                    let mut stream = response.bytes_stream();
-                    while let Some(item) = stream.next().await {
-                        let message = serde_json::from_slice::<ChatResponse>(&item.unwrap());
-                        println!("Message: {:?}", message);
-                    }
+                    let stream = response.bytes_stream();
+
+                    let messages: Vec<ChatResponse> = stream
+                        .map(|item| serde_json::from_slice::<ChatResponse>(&item.unwrap()).unwrap())
+                        .collect()
+                        .await;
+
+                    return Ok(messages);
                 }
             }
             Err(error) => {
@@ -177,7 +178,10 @@ impl OllamaApi {
             }
         }
 
-        Ok("".to_string())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to chat",
+        ))
     }
 }
 
@@ -202,7 +206,7 @@ impl Default for App {
             input: String::new(),
             input_mode: InputMode::Normal,
             character_index: 0,
-            chat_log: Vec::new(),
+            chat_log: ChatLog::default(),
             chat_scroll_state: ScrollbarState::new(0).position(0),
             chat_scroll: 0,
         }
@@ -248,12 +252,12 @@ impl App {
                     self.chat_message().await;
 
                     // TODO: analyze the code
-                    if self.chat_log.len() > (self.last_chat_area_height - 2) {
-                        self.chat_scroll = self.chat_log.len() - (self.last_chat_area_height - 2);
-                    } else {
-                        self.chat_scroll = 0;
-                    }
-                    self.chat_scroll_state.last();
+                    // if self.chat_log.len() > (self.last_chat_area_height - 2) {
+                    //     self.chat_scroll = self.chat_log.len() - (self.last_chat_area_height - 2);
+                    // } else {
+                    //     self.chat_scroll = 0;
+                    // }
+                    // self.chat_scroll_state.last();
                 }
                 KeyCode::Char(c) => self.update_input(c),
                 KeyCode::Backspace => self.delete_input(),
@@ -261,20 +265,21 @@ impl App {
                 KeyCode::Right => self.move_cursor_right(),
                 KeyCode::Down => {
                     // TODO: analyze the code
-                    let mut clamp: usize = 0;
-                    if self.chat_log.len() > self.last_chat_area_height - 2 {
-                        clamp = self.chat_log.len() - (self.last_chat_area_height - 2) + 1;
-                    }
+                    // let mut clamp: usize = 0;
+                    // if self.chat_log.len() > self.last_chat_area_height - 2 {
+                    //     clamp = self.chat_log.len() - (self.last_chat_area_height - 2) + 1;
+                    // }
 
-                    self.chat_scroll = self
-                        .chat_scroll
-                        .saturating_add(1)
-                        .clamp(0, clamp.saturating_sub(1));
-                    self.chat_scroll_state.next();
+                    // self.chat_scroll = self
+                    //     .chat_scroll
+                    //     .saturating_add(1)
+                    //     .clamp(0, clamp.saturating_sub(1));
+                    // self.chat_scroll_state.next();
                 }
                 KeyCode::Up => {
-                    self.chat_scroll = self.chat_scroll.saturating_sub(1);
-                    self.chat_scroll_state.prev();
+                    // TODO: analyze the code
+                    // self.chat_scroll = self.chat_scroll.saturating_sub(1);
+                    // self.chat_scroll_state.prev();
                 }
                 KeyCode::Esc => self.input_mode = InputMode::Normal,
                 _ => {}
@@ -298,10 +303,27 @@ impl App {
             return;
         }
 
-        self.chat_log.push(self.input.clone());
+        // TODO: if the input starts with '/', it is a command type
+        let input_chat = Chat {
+            author: "user".to_string(),
+            content: self.input.clone(),
+            origin_content: vec![ChatType::OllamaRequest(ChatRequest {
+                model: self.selected_model.name.clone(),
+                messages: vec![MessageChunk {
+                    role: "user".to_string(),
+                    content: self.input.clone(),
+                    images: None,
+                }],
+            })],
+        };
+        self.update_chat_log_single(input_chat.clone());
 
-        // TODO: ...
-        self.chat(self.input.clone()).await;
+        // TODO: async chat, because it is not good, when waiting for the response
+        if let ChatType::OllamaRequest(chat_request) = input_chat.origin_content[0].clone() {
+            self.chat(chat_request).await;
+        } else {
+            eprintln!("Error: input chat type is not OllamaRequest");
+        }
 
         self.input.clear();
         self.reset_cursor();
@@ -351,6 +373,22 @@ impl App {
             self.input = before_char_to_delete.chain(after_char_to_delete).collect();
             self.move_cursor_left();
         }
+    }
+
+    fn update_chat_log_single(&mut self, chat: Chat, stream: bool) {
+        self.chat_log.history.push(chat);
+    }
+
+    fn update_chat_log_multiple(&mut self, chats: Vec<Chat>) {
+        let new_chat = Chat {
+            author: "assistant".to_string(),
+            content: chats.last().unwrap().content.clone(),
+            origin_content: chats
+                .iter()
+                .map(|chat| chat.origin_content.clone())
+                .collect(),
+        };
+        self.chat_log.history.push(new_chat);
     }
 }
 
@@ -441,19 +479,28 @@ impl App {
     fn render_chat(&mut self, frame: &mut Frame, area: Rect) {
         let chat_log: Vec<Line> = self
             .chat_log
+            .history
             .iter()
-            .enumerate()
-            .map(|(i, c)| Line::from(Span::raw(format!("{i}: {c}"))))
+            .map(|history| {
+                Line::from(Span::raw(format!(
+                    "{}: {}",
+                    history.author, history.content
+                )))
+            })
             .collect();
 
         let chat = Paragraph::new(chat_log)
+            .wrap(Wrap { trim: true })
             .block(Block::bordered().title("Chat"))
             .scroll((self.chat_scroll as u16, 0));
         frame.render_widget(chat, area);
 
-        self.chat_scroll_state = self
-            .chat_scroll_state
-            .content_length(self.chat_log.len().saturating_sub(area.height as usize - 2));
+        self.chat_scroll_state = self.chat_scroll_state.content_length(
+            self.chat_log
+                .history
+                .len()
+                .saturating_sub(area.height as usize - 2),
+        );
 
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -511,18 +558,24 @@ impl App {
         }
     }
 
-    async fn chat(&mut self, prompt: String) {
-        let chat_request = ChatRequest {
-            model: self.selected_model.name.clone(),
-            // TODO: add history
-            messages: vec![MessageChunk {
-                role: "user".to_string(),
-                content: prompt,
-                images: None,
-            }],
-        };
-
+    async fn chat(&mut self, chat_request: ChatRequest) {
         let chat_response = self.ollama_api.chat(chat_request).await;
+        match chat_response {
+            Ok(chat_response) => {
+                for response in chat_response {
+                    let chat_response = Chat {
+                        author: "assistant".to_string(),
+                        content: response.message.content.clone(),
+                        origin_content: vec![ChatType::OllamaResponse(response.clone())],
+                    };
+                    self.update_chat_log(chat_response, true);
+                }
+            }
+            Err(error) => {
+                eprintln!("Error chatting: {}", error);
+                // TODO: show error message on tui
+            }
+        }
     }
 }
 
